@@ -1,42 +1,27 @@
-
-# Press ⌃R to execute it or replace it with your code.
-# Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
-
-
 """
-Scrapes a single book page from Books to Scrape (https://books.toscrape.com)
-and writes the extracted data to a CSV file.
-"""
-
-"""
-Books to Scrape – Category Scraper
-===================================
-Scrapes every book in a chosen category (handling pagination automatically)
-and writes all product data to a single CSV file.
-
-Usage:
-    python scrape_category.py
-
-Configuration:
-    Change CATEGORY_URL and OUTPUT_CSV near the top of the file to target a
-    different category or output path.
+Books to Scrape - Full Scraper
+Phases:
+  1. Scrape a single book product page → single_book.csv
+  2. Scrape all books in one category  → category_<name>.csv
+  3. Scrape every book across all categories → one CSV per category
+  4. Download cover images for every book scraped
 """
 
-import csv
+from csv import DictWriter
+import os
+import re
 import time
-import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-BASE_URL     = "https://books.toscrape.com/"
-CATEGORY_URL = "https://books.toscrape.com/catalogue/category/books/mystery_3/index.html"
-OUTPUT_CSV   = "mystery_books.csv"
-DELAY        = 0.5   # polite delay (seconds) between requests
-
-RATING_MAP   = {"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5}
-
-CSV_FIELDS   = [
+# ── Constants ────────────────────────────────────────────────────────────────
+BASE_URL   = "https://books.toscrape.com/"
+CAT_URL    = BASE_URL + "catalogue/"
+OUTPUT_DIR = "output"
+IMG_DIR    = os.path.join(OUTPUT_DIR, "images")
+HEADERS    = {"User-Agent": "Mozilla/5.0 (books-scraper/1.0)"}
+RATING_MAP = {"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5}
+CSV_FIELDS = [
     "product_page_url",
     "universal_product_code",
     "book_title",
@@ -49,157 +34,219 @@ CSV_FIELDS   = [
     "image_url",
 ]
 
-# ── HTTP helper ───────────────────────────────────────────────────────────────
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(IMG_DIR, exist_ok=True)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_soup(url: str) -> BeautifulSoup:
-    """Fetch *url* and return a parsed BeautifulSoup object."""
-    response = requests.get(url, timeout=10)
+    """Fetch a URL and return a BeautifulSoup object."""
+    response = requests.get(url, headers=HEADERS, timeout=15)
     response.raise_for_status()
-    response.encoding = "utf-8"
     return BeautifulSoup(response.text, "html.parser")
 
 
-# ── Phase 2 – Category crawler (with pagination) ──────────────────────────────
-
-def get_book_urls_from_category(category_url: str) -> list[str]:
-    """
-    Walk every page of *category_url* and return a list of absolute
-    product-page URLs for every book found.
-
-    Pagination is detected via the ``<li class="next">`` element; the loop
-    stops when that element is absent (i.e. we're on the last page).
-    """
-    book_urls: list[str] = []
-    page_url  = category_url
-    page_num  = 1
-
-    while page_url:
-        print(f"  Crawling category page {page_num}: {page_url}")
-        soup = get_soup(page_url)
-
-        # Every book card has an <h3><a href="..."> with a relative path like
-        # "../../../a-light-in-the-attic_1000/index.html"
-        for anchor in soup.select("article.product_pod h3 a"):
-            relative_href = anchor["href"]           # e.g. "../../some-book_123/index.html"
-            # Resolve relative to the *current page URL* so pagination works correctly
-            absolute_url  = urllib.parse.urljoin(page_url, relative_href)
-            book_urls.append(absolute_url)
-
-        # Check for a "next" button
-        next_btn = soup.select_one("li.next a")
-        if next_btn:
-            # href is relative to the current page (e.g. "page-2.html")
-            page_url = urllib.parse.urljoin(page_url, next_btn["href"])
-            page_num += 1
-            time.sleep(DELAY)
-        else:
-            page_url = None     # no more pages – exit the loop
-
-    print(f"  Found {len(book_urls)} books across {page_num} page(s).\n")
-    return book_urls
+def clean_price(raw: str) -> str:
+    """Strip currency symbol and whitespace from a price string."""
+    return raw.replace("Â", "").replace("£", "").strip()
 
 
-# ── Phase 1 – Individual book scraper ─────────────────────────────────────────
+def parse_quantity(raw: str) -> int:
+    """Extract the integer from 'In stock (22 available)'."""
+    match = re.search(r"\d+", raw)
+    return int(match.group()) if match else 0
+
+
+def resolve_image_url(img_src: str) -> str:
+    """Turn the relative ../../media/cache/... path into an absolute URL."""
+    # img_src always starts with ../../
+    relative = img_src.replace("../../", "")
+    return BASE_URL + relative
+
+
+def safe_filename(name: str) -> str:
+    """Make a string safe to use as a filename."""
+    return re.sub(r'[^a-zA-Z0-9_\-]', '_', name.lower())
+
+
+# ── Phase 1: scrape a single product page ────────────────────────────────────
 
 def scrape_book(url: str) -> dict:
     """
-    Visit a single book product page and return a dict with all required fields.
+    Visit one book product page and return a dict with all required fields.
+    Also downloads the cover image to IMG_DIR.
     """
     soup = get_soup(url)
 
-    # Title
-    book_title = soup.find("h1").get_text(strip=True)
-
-    # Product information table (UPC, prices, availability)
-    table_rows = soup.select("table.table-striped tr")
-    table_data = {
-        row.find("th").get_text(strip=True): row.find("td").get_text(strip=True)
-        for row in table_rows
+    # Table rows: UPC, Price (excl. tax), Price (incl. tax), Availability
+    table = {
+        row.find("th").text.strip(): row.find("td").text.strip()
+        for row in soup.select("table.table tr")
     }
 
-    upc            = table_data.get("UPC", "")
-    price_excl_tax = table_data.get("Price (excl. tax)", "")
-    price_incl_tax = table_data.get("Price (incl. tax)", "")
-    availability_raw = table_data.get("Availability", "")
-
-    # Parse integer from "In stock (22 available)"
-    if "(" in availability_raw:
-        quantity_available = availability_raw.split("(")[1].split(" ")[0]
-    else:
-        quantity_available = "0"
-
-    # Description (the <p> sibling that immediately follows #product_description)
+    # Description (may be absent on some books)
     desc_tag = soup.select_one("#product_description ~ p")
-    product_description = desc_tag.get_text(strip=True) if desc_tag else ""
+    description = desc_tag.text.strip() if desc_tag else ""
 
-    # Category – second-to-last breadcrumb: Home > Category > Book title
+    # Category: second-to-last breadcrumb item
     breadcrumbs = soup.select("ul.breadcrumb li")
-    category = breadcrumbs[-2].get_text(strip=True) if len(breadcrumbs) >= 3 else ""
+    category = breadcrumbs[-2].text.strip() if len(breadcrumbs) >= 2 else ""
 
-    # Star rating – CSS class on <p class="star-rating Three">
-    rating_tag    = soup.select_one("p.star-rating")
-    rating_word   = rating_tag["class"][1] if rating_tag else "Zero"
+    # Star rating: class list looks like ['star-rating', 'Three']
+    rating_classes = soup.select_one("p.star-rating")["class"]
+    rating_word = rating_classes[1] if len(rating_classes) > 1 else "Zero"
     review_rating = RATING_MAP.get(rating_word, 0)
 
-    # Thumbnail image – resolve relative src to absolute URL
-    img_tag = soup.select_one("#product_gallery img")
-    img_src = img_tag["src"] if img_tag else ""
-    if img_src.startswith("../"):
-        image_url = BASE_URL + img_src.replace("../../", "")
-    else:
-        image_url = img_src
+    # Absolute image URL
+    img_src = soup.select_one("#product_gallery img")["src"]
+    image_url = resolve_image_url(img_src)
+
+    # Download image
+    download_image(image_url, category)
 
     return {
-        "product_page_url":       url,
-        "universal_product_code": upc,
-        "book_title":             book_title,
-        "price_including_tax":    price_incl_tax,
-        "price_excluding_tax":    price_excl_tax,
-        "quantity_available":     quantity_available,
-        "product_description":    product_description,
-        "category":               category,
-        "review_rating":          review_rating,
-        "image_url":              image_url,
+        "product_page_url":     url,
+        "universal_product_code": table.get("UPC", ""),
+        "book_title":           soup.select_one("h1").text.strip(),
+        "price_including_tax":  clean_price(table.get("Price (incl. tax)", "")),
+        "price_excluding_tax":  clean_price(table.get("Price (excl. tax)", "")),
+        "quantity_available":   parse_quantity(table.get("Availability", "")),
+        "product_description":  description,
+        "category":             category,
+        "review_rating":        review_rating,
+        "image_url":            image_url,
     }
+
+
+def download_image(image_url: str, category: str) -> None:
+    """Download a cover image and save it under IMG_DIR/<category>/."""
+    cat_dir = os.path.join(IMG_DIR, safe_filename(category))
+    os.makedirs(cat_dir, exist_ok=True)
+    filename = image_url.split("/")[-1]
+    filepath = os.path.join(cat_dir, filename)
+    if not os.path.exists(filepath):          # skip if already saved
+        response = requests.get(image_url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+        with open(filepath, "wb") as f:
+            f.write(response.content)
+
+
+# ── Phase 2: scrape all book URLs from one category (with pagination) ─────────
+
+def get_book_urls_from_category(category_url: str) -> list[str]:
+    """
+    Walk every page of a category listing and return all product-page URLs.
+    Handles pagination automatically.
+    """
+    urls = []
+    page_url = category_url
+
+    while page_url:
+        soup = get_soup(page_url)
+
+        for article in soup.select("article.product_pod"):
+            href = article.select_one("h3 a")["href"]
+            # href is relative to the catalogue/ directory
+            # e.g. "../../../catalogue/book-title_123/index.html"
+            # Strip leading "../" segments and prepend CAT_URL
+            clean_href = href.replace("../", "")
+            urls.append(CAT_URL + clean_href)
+
+        # Check for a "next" page button
+        next_btn = soup.select_one("li.next a")
+        if next_btn:
+            next_href = next_btn["href"]
+            # next_href is relative to the current page directory
+            page_dir = page_url.rsplit("/", 1)[0] + "/"
+            page_url = page_dir + next_href
+        else:
+            page_url = None
+
+    return urls
+
+
+def scrape_category(category_url: str, category_name: str) -> list[dict]:
+    """Scrape every book in a category and return a list of book dicts."""
+    print(f"  → Collecting book URLs for '{category_name}' ...")
+    book_urls = get_book_urls_from_category(category_url)
+    print(f"     Found {len(book_urls)} books.")
+
+    books = []
+    for i, url in enumerate(book_urls, 1):
+        print(f"     Scraping book {i}/{len(book_urls)}: {url.split('/')[-2]}")
+        try:
+            books.append(scrape_book(url))
+            time.sleep(0.2)   # be polite
+        except Exception as exc:
+            print(f"     WARNING: Failed to scrape {url}: {exc}")
+
+    return books
 
 
 # ── CSV writer ────────────────────────────────────────────────────────────────
 
-def write_csv(records: list[dict], filepath: str) -> None:
-    """Write *records* to a CSV file at *filepath*."""
-    with open(filepath, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
+def write_csv(books: list[dict], filepath: str) -> None:
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
-        writer.writerows(records)
-    print(f"\nSaved {len(records)} records → {filepath}")
+        writer.writerows(books)
+    print(f"  ✓ Saved {len(books)} records → {filepath}")
+
+
+# ── Phase 3: discover all categories ─────────────────────────────────────────
+
+def get_all_categories() -> list[tuple[str, str]]:
+    """
+    Return a list of (category_name, category_url) tuples for every category
+    listed on the Books to Scrape homepage.
+    """
+    soup = get_soup(BASE_URL)
+    categories = []
+    for link in soup.select("ul.nav-list ul li a"):
+        name = link.text.strip()
+        href = link["href"]                   # e.g. "catalogue/travel_2/index.html"
+        url  = BASE_URL + href
+        categories.append((name, url))
+    return categories
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    print(f"Category : {CATEGORY_URL}")
-    print(f"Output   : {OUTPUT_CSV}\n")
-
-    # Step 1 – collect every book URL in the category (all pages)
-    print("Step 1 – Collecting book URLs …")
-    book_urls = get_book_urls_from_category(CATEGORY_URL)
-
-    # Step 2 – scrape each product page
-    print("Step 2 – Scraping individual book pages …")
-    records: list[dict] = []
-    for idx, url in enumerate(book_urls, start=1):
-        print(f"  [{idx:>3}/{len(book_urls)}] {url.split('/')[-2]}")
-        try:
-            records.append(scrape_book(url))
-        except Exception as exc:
-            print(f"         ERROR: {exc} – skipping")
-        time.sleep(DELAY)
-
-    # Step 3 – write results to CSV
-    print("\nStep 3 – Writing CSV …")
-    write_csv(records, OUTPUT_CSV)
-    print("Done.")
-
-
 if __name__ == "__main__":
-    main()
+
+    # ── Phase 1: Single book ─────────────────────────────────────────────────
+    print("\n=== Phase 1: Single book ===")
+    SINGLE_BOOK_URL = (
+        "https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html"
+    )
+    book_data = scrape_book(SINGLE_BOOK_URL)
+    write_csv([book_data], os.path.join(OUTPUT_DIR, "single_book.csv"))
+    print(f"  Title  : {book_data['book_title']}")
+    print(f"  UPC    : {book_data['universal_product_code']}")
+    print(f"  Price  : £{book_data['price_including_tax']} (incl. tax)")
+    print(f"  Rating : {book_data['review_rating']} / 5")
+    print(f"  Image  : {book_data['image_url']}")
+
+    # ── Phase 2: One category (Mystery) ──────────────────────────────────────
+    print("\n=== Phase 2: One category (Mystery) ===")
+    MYSTERY_URL = "https://books.toscrape.com/catalogue/category/books/mystery_3/index.html"
+    mystery_books = scrape_category(MYSTERY_URL, "Mystery")
+    write_csv(mystery_books, os.path.join(OUTPUT_DIR, "category_mystery.csv"))
+
+    # ── Phase 3+4: All categories → separate CSV + images ────────────────────
+    print("\n=== Phase 3+4: All categories ===")
+    categories = get_all_categories()
+    print(f"  Discovered {len(categories)} categories.\n")
+
+    for cat_name, cat_url in categories:
+        print(f"[{cat_name}]")
+        books = scrape_category(cat_url, cat_name)
+        csv_path = os.path.join(
+            OUTPUT_DIR, f"category_{safe_filename(cat_name)}.csv"
+        )
+        write_csv(books, csv_path)
+
+    print("\n✅ All done!")
+    print(f"   CSV files  → {OUTPUT_DIR}/")
+    print(f"   Images     → {IMG_DIR}/")
