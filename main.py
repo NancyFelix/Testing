@@ -32,6 +32,7 @@ CSV_FIELDS = [
     "category",
     "review_rating",
     "image_url",
+    "local_image_path',
 ]
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -102,34 +103,39 @@ def scrape_book(url: str) -> dict:
     img_src = soup.select_one("#product_gallery img")["src"]
     image_url = resolve_image_url(img_src)
 
-    # Download image
-    download_image(image_url, category)
+    # Book title needed before download so we can name the file
+    book_title = soup.select_one("h1").text.strip()
+
+    # Download cover image, named after the book title
+    local_image_path = download_image(image_url, category, book_title)
 
     return {
         "product_page_url":     url,
         "universal_product_code": table.get("UPC", ""),
-        "book_title":           soup.select_one("h1").text.strip(),
+        "book_title":           book_title,
         "price_including_tax":  clean_price(table.get("Price (incl. tax)", "")),
         "price_excluding_tax":  clean_price(table.get("Price (excl. tax)", "")),
         "quantity_available":   parse_quantity(table.get("Availability", "")),
         "product_description":  description,
         "category":             category,
         "review_rating":        review_rating,
-        "image_url":            image_url,
+        "local_image_path":     image_url,
     }
 
 
-def download_image(image_url: str, category: str) -> None:
+def download_image(image_url: str, category: str, book_title:str) -> str:
     """Download a cover image and save it under IMG_DIR/<category>/."""
     cat_dir = os.path.join(IMG_DIR, safe_filename(category))
     os.makedirs(cat_dir, exist_ok=True)
-    filename = image_url.split("/")[-1]
+    filename = safe_filename(book_title) + ".jpg"
     filepath = os.path.join(cat_dir, filename)
     if not os.path.exists(filepath):          # skip if already saved
         response = requests.get(image_url, headers=HEADERS, timeout=15)
         response.raise_for_status()
         with open(filepath, "wb") as f:
             f.write(response.content)
+        print(f" Image saved-> {filepath}")
+      return filepath
 
 
 # ── Phase 2: scrape all book URLs from one category (with pagination) ─────────
